@@ -13,6 +13,13 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+dist.init_process_group(backend='gloo')
+print('INITIALIZED', dist.get_rank(), os.getpid())
+
+from torch.distributed.parallel import DistributedDataParallel
+
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -64,12 +71,13 @@ def main():
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+        for p in model.parameters():
+            dist.broadcast(p.data, 0)
 
     if args.arch.startswith('alexnet') or args.arch.startswith('vgg'):
-        model.features = torch.nn.DataParallel(model.features)
-        model.cuda()
+        raise RuntimeError("not supported")
     else:
-        model = torch.nn.DataParallel(model).cuda()
+        model = DistributedDataParallel(model).cuda()
 
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
@@ -100,15 +108,17 @@ def main():
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
+    train_dataset = datasets.ImageFolder(traindir, transforms.Compose([
+                        transforms.RandomSizedCrop(224),
+                        transforms.RandomHorizontalFlip(),
+                        transforms.ToTensor(),
+                        normalize,
+                    ]))
+    sampler = DistributedSampler(train_dataset, dist.get_num_processes(), dist.get_rank())
+
     train_loader = torch.utils.data.DataLoader(
-        datasets.ImageFolder(traindir, transforms.Compose([
-            transforms.RandomSizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ])),
-        batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, pin_memory=True)
+        train_dataset, batch_size=args.batch_size,
+        sampler=sampler, num_workers=args.workers, pin_memory=True)
 
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
@@ -125,6 +135,7 @@ def main():
         return
 
     for epoch in range(args.start_epoch, args.epochs):
+        sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch)
 
         # train for one epoch
@@ -192,6 +203,11 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, top1=top1, top5=top5))
+
+        if i == 4:
+            import sys
+            torch.cuda.synchronize()
+            sys.exit(0)
 
 
 def validate(val_loader, model, criterion):
